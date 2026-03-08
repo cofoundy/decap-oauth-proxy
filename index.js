@@ -1,5 +1,8 @@
 const express = require("express");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,14 +11,33 @@ const PORT = process.env.PORT || 3000;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 
-// GitHub PAT — used for all CMS operations (shared token)
+// GitHub App credentials (replaces GITHUB_PAT)
+const GITHUB_APP_ID = process.env.GITHUB_APP_ID;
+const GITHUB_APP_PRIVATE_KEY_B64 = process.env.GITHUB_APP_PRIVATE_KEY; // base64-encoded PEM
+const GITHUB_APP_INSTALLATION_ID = process.env.GITHUB_APP_INSTALLATION_ID;
+
+// Fallback: legacy GITHUB_PAT (for migration period)
 const GITHUB_PAT = process.env.GITHUB_PAT;
 
-// Allowed emails (comma-separated). If empty, any Google email can login.
-const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || "")
+// Allowed emails — from env var + allowed-emails.json file
+const envEmails = (process.env.ALLOWED_EMAILS || "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
+
+let fileEmails = [];
+try {
+  const emailsFile = path.join(__dirname, "allowed-emails.json");
+  if (fs.existsSync(emailsFile)) {
+    fileEmails = JSON.parse(fs.readFileSync(emailsFile, "utf8")).map((s) =>
+      s.trim().toLowerCase()
+    );
+  }
+} catch (err) {
+  console.warn("Could not read allowed-emails.json:", err.message);
+}
+
+const ALLOWED_EMAILS = [...new Set([...envEmails, ...fileEmails])];
 
 // CORS origins
 const ALLOWED_ORIGINS = (process.env.ORIGINS || "")
@@ -27,9 +49,73 @@ const ALLOWED_ORIGINS = (process.env.ORIGINS || "")
 const GH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
 const GH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
 
-if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GITHUB_PAT) {
-  console.error("Missing required env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GITHUB_PAT");
+// Validate required env vars
+const useGitHubApp = GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY_B64 && GITHUB_APP_INSTALLATION_ID;
+const useLegacyPAT = !!GITHUB_PAT;
+
+if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+  console.error("Missing required env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET");
   process.exit(1);
+}
+
+if (!useGitHubApp && !useLegacyPAT) {
+  console.error("Missing GitHub auth: set GITHUB_APP_ID+GITHUB_APP_PRIVATE_KEY+GITHUB_APP_INSTALLATION_ID or GITHUB_PAT");
+  process.exit(1);
+}
+
+// ── GitHub App Token Management ──
+
+let cachedToken = null;
+let tokenExpiry = 0;
+
+function getPrivateKey() {
+  return Buffer.from(GITHUB_APP_PRIVATE_KEY_B64, "base64").toString("utf8");
+}
+
+function createAppJWT() {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iat: now - 60, // 60s clock drift allowance
+    exp: now + 600, // 10 min max
+    iss: GITHUB_APP_ID,
+  };
+  return jwt.sign(payload, getPrivateKey(), { algorithm: "RS256" });
+}
+
+async function getInstallationToken() {
+  // Return cached token if still valid
+  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+
+  const appJWT = createAppJWT();
+  const res = await fetch(
+    `https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${appJWT}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    }
+  );
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Failed to get installation token: ${res.status} ${err}`);
+  }
+
+  const data = await res.json();
+  cachedToken = data.token;
+  // Refresh 5 min before expiry (tokens last 1 hour)
+  tokenExpiry = Date.now() + 55 * 60 * 1000;
+
+  console.log("GitHub App installation token refreshed");
+  return cachedToken;
+}
+
+async function getGitHubToken() {
+  if (useGitHubApp) return getInstallationToken();
+  return GITHUB_PAT;
 }
 
 // State store (in-memory, fine for single instance)
@@ -49,7 +135,13 @@ app.use((req, res, next) => {
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "decap-oauth-proxy", auth: "google" });
+  res.json({
+    status: "ok",
+    service: "decap-oauth-proxy",
+    auth: "google",
+    github: useGitHubApp ? "app" : "pat",
+    emails: ALLOWED_EMAILS.length || "all",
+  });
 });
 
 // ── Google OAuth Flow ──
@@ -128,8 +220,9 @@ app.get("/callback/google", async (req, res) => {
       `);
     }
 
-    // Return GitHub PAT to Decap CMS via postMessage
-    const postMessage = JSON.stringify({ token: GITHUB_PAT, provider: "github" });
+    // Get GitHub token (from App or PAT)
+    const ghToken = await getGitHubToken();
+    const postMessage = JSON.stringify({ token: ghToken, provider: "github" });
 
     res.send(`
       <html><body><script>
@@ -221,7 +314,7 @@ function getBaseUrl(req) {
 
 app.listen(PORT, () => {
   console.log(`Decap OAuth proxy running on port ${PORT}`);
-  console.log(`Auth mode: Google OAuth → GitHub PAT`);
+  console.log(`Auth mode: Google OAuth → GitHub ${useGitHubApp ? "App" : "PAT"}`);
   console.log(`Allowed emails: ${ALLOWED_EMAILS.length ? ALLOWED_EMAILS.join(", ") : "ALL"}`);
   console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ") || "ALL"}`);
 });

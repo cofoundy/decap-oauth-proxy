@@ -1,12 +1,13 @@
 {
   "name": "decap-oauth-proxy",
-  "version": "1.0.0",
-  "description": "Self-hosted OAuth proxy for Decap CMS with GitHub authentication",
+  "version": "2.0.0",
+  "description": "Self-hosted OAuth proxy for Decap CMS — Google login + GitHub App tokens",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2"
   }
 }
