@@ -114,8 +114,12 @@ async function getInstallationToken() {
 }
 
 async function getGitHubToken() {
+  // PAT takes priority — Decap CMS name:github backend calls GET /user
+  // which requires a user token (App installation tokens return 403).
+  // GitHub App is kept for future use when Decap adds support.
+  if (useLegacyPAT) return GITHUB_PAT;
   if (useGitHubApp) return getInstallationToken();
-  return GITHUB_PAT;
+  throw new Error("No GitHub token available");
 }
 
 // Parse JSON bodies (for GitHub API proxy)
@@ -142,7 +146,7 @@ app.get("/", (req, res) => {
     status: "ok",
     service: "decap-oauth-proxy",
     auth: "google",
-    github: useGitHubApp ? "app" : "pat",
+    github: useLegacyPAT ? "pat" : useGitHubApp ? "app" : "none",
     emails: ALLOWED_EMAILS.length || "all",
   });
 });
