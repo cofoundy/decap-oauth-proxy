@@ -118,6 +118,9 @@ async function getGitHubToken() {
   return GITHUB_PAT;
 }
 
+// Parse JSON bodies (for GitHub API proxy)
+app.use(express.json({ limit: "10mb" }));
+
 // State store (in-memory, fine for single instance)
 const states = new Map();
 
@@ -303,6 +306,54 @@ app.get("/callback", async (req, res) => {
   } catch (err) {
     console.error("GitHub OAuth callback error:", err);
     res.status(500).send("Authentication failed");
+  }
+});
+
+// ── GitHub API Proxy ──
+// Decap CMS with name:github calls base_url/api/v3/* for all GitHub operations.
+// We intercept these and proxy to GitHub API using the App installation token.
+// This is needed because App tokens don't work with GET /user (no user identity).
+
+app.all("/api/v3/user", async (req, res) => {
+  // Decap CMS calls GET /user to verify the token has repo access.
+  // App installation tokens don't represent a user, so we return a fake user.
+  res.json({
+    login: "cofoundy-cms[bot]",
+    id: 0,
+    name: "Cofoundy CMS",
+    email: "cms@cofoundy.dev",
+  });
+});
+
+app.all("/api/v3/*", async (req, res) => {
+  // Proxy all other GitHub API calls using the App token
+  const ghPath = req.params[0]; // everything after /api/v3/
+  const ghUrl = `https://api.github.com/${ghPath}${req.url.includes("?") ? "?" + req.url.split("?")[1] : ""}`;
+
+  try {
+    const token = await getGitHubToken();
+    const ghRes = await fetch(ghUrl, {
+      method: req.method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: req.headers.accept || "application/vnd.github+json",
+        "Content-Type": req.headers["content-type"] || "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body),
+    });
+
+    const contentType = ghRes.headers.get("content-type");
+    if (contentType && contentType.includes("json")) {
+      const data = await ghRes.json();
+      res.status(ghRes.status).json(data);
+    } else {
+      const text = await ghRes.text();
+      res.status(ghRes.status).send(text);
+    }
+  } catch (err) {
+    console.error("GitHub API proxy error:", err);
+    res.status(502).json({ message: "GitHub API proxy error", error: err.message });
   }
 });
 
